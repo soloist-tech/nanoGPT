@@ -29,6 +29,9 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+from torch.utils.tensorboard import SummaryWriter
+
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -103,6 +106,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir='tensorout')
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -263,6 +267,10 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        for name, param in raw_model.named_parameters():
+            writer.add_histogram(f'Weights/{name}', param.data.cpu(), iter_num)
+            if param.grad is not None:
+                writer.add_histogram(f'Gradients/{name}', param.grad.data.cpu(), iter_num)
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -271,6 +279,10 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+            writer.add_scalar('Loss/train', losses['train'], iter_num)
+            writer.add_scalar('Loss/val', losses['val'], iter_num)
+            writer.add_scalar('Learning Rate', lr, iter_num)
+            writer.add_scalar('MFU', running_mfu * 100, iter_num)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -325,12 +337,16 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        writer.add_scalar('Loss/iteration', lossf, iter_num)
+        writer.add_scalar('Time/iteration', dt, iter_num)
+        writer.add_scalar('MFU', running_mfu * 100, iter_num)
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
     if iter_num > max_iters:
         break
+writer.close()
 
 if ddp:
     destroy_process_group()
