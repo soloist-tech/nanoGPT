@@ -26,6 +26,29 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+def log_wavelet_attention(model, writer, iter_num):
+    total_attention = 0
+    num_layers = 0
+    for name, module in model.named_modules():
+        if isinstance(module, CausalSelfAttention):
+            total_attention += module.wavelet_attention.item()
+            num_layers += 1
+    avg_attention = total_attention / num_layers if num_layers > 0 else 0
+    writer.add_scalar('Attention/wavelet', avg_attention, iter_num)
+
+class WaveletAggregator(nn.Module):
+    def __init__(self, wavelet_dim, n_embd):
+        super().__init__()
+        self.projection = nn.Linear(wavelet_dim, n_embd)
+    
+    def forward(self, wavelets, tokens):
+        # Aggregate wavelets between spaces or punctuation
+        mask = (tokens == 32) | ((tokens >= 33) & (tokens <= 47))  # space and punctuation
+        agg_wavelets = torch.zeros_like(wavelets)
+        agg_wavelets[:, 1:] = wavelets[:, 1:] - wavelets[:, :-1]
+        agg_wavelets = torch.where(mask.unsqueeze(-1), agg_wavelets, torch.zeros_like(agg_wavelets))
+        return self.projection(agg_wavelets)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -48,15 +71,26 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        
+        # Add wavelet processing
+        self.wavelet_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.register_buffer("wavelet_attention", torch.zeros(1))
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+    def forward(self, x, agg_wavelets):
+        B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # Incorporate wavelet attention
+        w_att = self.wavelet_proj(agg_wavelets).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q + w_att
+
+        # Store the average wavelet attention
+        self.wavelet_attention = w_att.mean()
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -69,6 +103,7 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -100,28 +135,37 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, agg_wavelets):
+        x = x + self.attn(self.ln_1(x), agg_wavelets)
         x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = True
+    wavelet_dim: int = 32
+
+class WaveletProcessingLayer(nn.Module):
+    def __init__(self, wavelet_dim, n_embd):
+        super().__init__()
+        self.wavelet_projection = nn.Linear(wavelet_dim, n_embd)
+    
+    def forward(self, wavelets):
+        return self.wavelet_projection(wavelets)
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.wavelet_aggregator = WaveletAggregator(config.wavelet_dim, config.n_embd)
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -131,12 +175,8 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
+        # tie weights
+        self.transformer.wte.weight = self.lm_head.weight 
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -144,8 +184,21 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        # Add wavelet processing layer
+        self.wavelet_aggregator = WaveletAggregator(config.wavelet_dim, config.n_embd)
+        self.wavelet_processing = WaveletProcessingLayer(config.wavelet_dim, config.n_embd)
+
+        # report number of parameters (note we don't count the decoder parameters in lm_head)
+        n_params = sum(p.numel() for p in self.transformer.parameters())
+        print("number of parameters: %.2fM" % (n_params/1e6,))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -159,38 +212,42 @@ class GPT(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, targets=None):
+    def forward(self, idx, wavelets, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        
+        # Aggregate wavelets
+        agg_wavelets = self.wavelet_aggregator(wavelets, idx)
+        
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, agg_wavelets)
         x = self.transformer.ln_f(x)
 
+        # Calculate logits
+        logits = self.lm_head(x)
+
+        # Calculate losses if targets are provided
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            total_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            wavelet_loss = F.mse_loss(agg_wavelets, torch.zeros_like(agg_wavelets))  # Example: penalize non-zero wavelet embeddings
+            loss = total_loss + wavelet_loss
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+            total_loss = None
+            wavelet_loss = None
 
-        return logits, loss
+        return logits, loss, total_loss, wavelet_loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

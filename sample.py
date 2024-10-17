@@ -44,9 +44,59 @@ if init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
+    wavelet_dim = checkpoint['model_args'].get('wavelet_dim', 32)  # Default to 32 if not found
+    model.config.wavelet_dim = wavelet_dim
+    if 'vocab_size' in checkpoint['model_args']:
+        model.config.vocab_size = checkpoint['model_args']['vocab_size']
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+    wavelet_dim = 32
+    model.config.wavelet_dim = wavelet_dim
+
+def generate_with_wavelets(model, x, max_new_tokens, temperature, top_k, wavelet_dim):
+    for _ in range(max_new_tokens):
+        # if the sequence context is growing too long we must crop it at block_size
+        idx_cond = x if x.size(1) <= model.config.block_size else x[:, -model.config.block_size:]
+        
+        # Create a dummy wavelet input
+        dummy_wavelets = torch.zeros((idx_cond.size(0), idx_cond.size(1), wavelet_dim), device=device)
+        
+        # Forward the model to get the logits for the index in the sequence
+        output = model(idx_cond, dummy_wavelets)
+        
+        # Check if the output is a tuple (it might be if the model returns both logits and loss)
+        if isinstance(output, tuple):
+            logits = output[0]
+        else:
+            logits = output
+        
+        # Ensure we're only looking at the last token's logits
+        logits = logits[:, -1, :]
+        
+        # Clip logits to the vocab size
+        logits = logits[:, :model.config.vocab_size]
+        
+        # Pluck the logits at the final step and scale by desired temperature
+        logits = logits / temperature
+        # Optionally crop the logits to only the top k options
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+        # Apply softmax to convert logits to (normalized) probabilities
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        # Sample from the distribution
+        idx_next = torch.multinomial(probs, num_samples=1)
+        # Ensure the sampled index is within the vocab size
+        idx_next = torch.clamp(idx_next, 0, model.config.vocab_size - 1)
+        # Append sampled index to the running sequence and continue
+        x = torch.cat((x, idx_next), dim=1)
+    
+    return x
+
+def safe_encode(s, vocab_size):
+    encoded = encode(s)
+    return [token for token in encoded if token < vocab_size]
 
 model.eval()
 model.to(device)
@@ -81,9 +131,24 @@ start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
+start_ids = safe_encode(start, model.config.vocab_size)
+x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+print(f"Initial input shape: {x.shape}")
+print(f"Model config: {model.config}")
+print(f"Vocabulary size: {model.config.vocab_size}")
+
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+            try:
+                y = generate_with_wavelets(model, x, max_new_tokens, temperature, top_k, wavelet_dim)
+                generated_text = decode(y[0].tolist())
+                print(f"Generated text (sample {k+1}):")
+                print(generated_text)
+                print('---------------')
+            except Exception as e:
+                print(f"Error during generation (sample {k+1}): {str(e)}")
+                print(f"Current sequence: {x}")
+                print(f"Current sequence decoded: {decode(x[0].tolist())}")
+                continue

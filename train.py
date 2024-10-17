@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, CausalSelfAttention
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -49,7 +49,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 128 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -117,22 +117,22 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+wavelet_dim = 32
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    data = np.memmap(os.path.join(data_dir, f'{split}_ids.bin'), dtype=np.uint16, mode='r')
+    wavelets = np.memmap(os.path.join(data_dir, f'{split}_wavelets.bin'), dtype=np.float32, mode='r')
+    wavelets = wavelets.reshape(-1, wavelet_dim)  # Use the global wavelet_dim here
+    
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    w = torch.stack([torch.from_numpy((wavelets[i:i+block_size]).astype(np.float32)) for i in ix])
+    
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x, y, w = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True), w.pin_memory().to(device, non_blocking=True)
     else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        x, y, w = x.to(device), y.to(device), w.to(device)
+    return x, w, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -148,8 +148,7 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, bias=bias, vocab_size=None, dropout=dropout, wavelet_dim=wavelet_dim) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -217,16 +216,30 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
+def estimate_loss_and_perplexity():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters, device=device)
+        for k in range(eval_iters):
+            X, W, Y = get_batch(split)
+            logits, loss, total_loss, wavelet_loss = model(X, W, Y)
+            losses[k] = total_loss
+        out[f'{split}_loss'] = losses.mean().item()
+        out[f'{split}_perplexity'] = torch.exp(losses.mean()).item()
+    model.train()
+    return out
+
+@torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
+            X, W, Y = get_batch(split)
+            logits, loss, total_loss, wavelet_loss = model(X, W, Y)
+            losses[k] = total_loss.item()
         out[split] = losses.mean()
     model.train()
     return out
@@ -245,16 +258,33 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+def log_wavelet_embeddings(model, writer, iter_num):
+    wavelet_processing = model.wavelet_processing if hasattr(model, 'wavelet_processing') else model.module.wavelet_processing
+    weights = wavelet_processing.wavelet_projection.weight.data
+    writer.add_histogram('Wavelet_Embeddings/weights', weights, iter_num)
+    writer.add_image('Wavelet_Embeddings/weight_matrix', weights.unsqueeze(0), iter_num, dataformats='CHW')
+
+def log_wavelet_attention(model, writer, iter_num):
+    total_attention = 0
+    num_layers = 0
+    for name, module in model.named_modules():
+        if isinstance(module, CausalSelfAttention):
+            if hasattr(module, 'wavelet_attention'):
+                total_attention += module.wavelet_attention.item()
+                num_layers += 1
+    avg_attention = total_attention / num_layers if num_layers > 0 else 0
+    writer.add_scalar('Attention/wavelet', avg_attention, iter_num)
+
 # logging
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, W, Y = get_batch('train')  # fetch the very first batch
 t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+local_iter_num = 0
+raw_model = model.module if ddp else model
 running_mfu = -1.0
 while True:
 
@@ -265,8 +295,15 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
+        metrics = estimate_loss_and_perplexity()
+        print(f"step {iter_num}: train loss {metrics['train_loss']:.4f}, val loss {metrics['val_loss']:.4f}")
+        print(f"train perplexity {metrics['train_perplexity']:.4f}, val perplexity {metrics['val_perplexity']:.4f}")
+        writer.add_scalar('Perplexity/train', metrics['train_perplexity'], iter_num)
+        writer.add_scalar('Perplexity/val', metrics['val_perplexity'], iter_num)
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        log_wavelet_embeddings(raw_model, writer, iter_num)
+        log_wavelet_attention(raw_model, writer, iter_num)
         for name, param in raw_model.named_parameters():
             writer.add_histogram(f'Weights/{name}', param.data.cpu(), iter_num)
             if param.grad is not None:
@@ -303,22 +340,16 @@ while True:
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+            logits, loss, total_loss, wavelet_loss = model(X, W, Y)
+            loss = loss / gradient_accumulation_steps
+        X, W, Y = get_batch('train')
         scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.unscale_(optimizer)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
@@ -329,17 +360,20 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-        writer.add_scalar('Loss/iteration', lossf, iter_num)
-        writer.add_scalar('Time/iteration', dt, iter_num)
-        writer.add_scalar('MFU', running_mfu * 100, iter_num)
+    if iter_num % eval_interval == 0 and master_process:
+        try:
+            metrics = estimate_loss_and_perplexity()
+            print(f"step {iter_num}: train loss {metrics['train_loss']:.4f}, val loss {metrics['val_loss']:.4f}")
+            print(f"train perplexity {metrics['train_perplexity']:.4f}, val perplexity {metrics['val_perplexity']:.4f}")
+            writer.add_scalar('Perplexity/train', metrics['train_perplexity'], iter_num)
+            writer.add_scalar('Perplexity/val', metrics['val_perplexity'], iter_num)
+            losses = estimate_loss()
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            log_wavelet_embeddings(raw_model, writer, iter_num)
+            log_wavelet_attention(raw_model, writer, iter_num)
+            # ... (rest of the logging code)
+        except Exception as e:
+            print(f"Error during logging at step {iter_num}: {str(e)}")
     iter_num += 1
     local_iter_num += 1
 
