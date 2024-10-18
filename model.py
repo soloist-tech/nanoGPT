@@ -1,12 +1,3 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
 import math
 import inspect
 from dataclasses import dataclass
@@ -164,6 +155,7 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        self.last_agg_wavelets = None
         self.config = config
         self.wavelet_aggregator = WaveletAggregator(config.wavelet_dim, config.n_embd)
 
@@ -224,6 +216,7 @@ class GPT(nn.Module):
         
         # Aggregate wavelets
         agg_wavelets = self.wavelet_aggregator(wavelets, idx)
+        self.last_agg_wavelets = agg_wavelets
         
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
@@ -248,6 +241,9 @@ class GPT(nn.Module):
             wavelet_loss = None
 
         return logits, loss, total_loss, wavelet_loss
+
+    def get_aggregated_wavelets(self):
+        return self.last_agg_wavelets
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
