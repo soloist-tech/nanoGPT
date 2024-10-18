@@ -31,6 +31,20 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+def load_state_dict_with_mismatch(model, state_dict):
+    model_state_dict = model.state_dict()
+    for name, param in state_dict.items():
+        if name in model_state_dict:
+            if 'wavelet_attention' not in name:  # Skip wavelet_attention parameters
+                if model_state_dict[name].shape != param.shape:
+                    print(f"Mismatch in {name}: checkpoint shape {param.shape}, model shape {model_state_dict[name].shape}")
+                    print(f"Skipping parameter {name} due to shape mismatch")
+                else:
+                    model_state_dict[name].copy_(param)
+        else:
+            print(f"Skipping {name} as it's not in the current model")
+    model.load_state_dict(model_state_dict, strict=False)
+
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
@@ -43,7 +57,10 @@ if init_from == 'resume':
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    
+    # Use the new function here
+    load_state_dict_with_mismatch(model, state_dict)
+    
     wavelet_dim = checkpoint['model_args'].get('wavelet_dim', 32)  # Default to 32 if not found
     model.config.wavelet_dim = wavelet_dim
     if 'vocab_size' in checkpoint['model_args']:
