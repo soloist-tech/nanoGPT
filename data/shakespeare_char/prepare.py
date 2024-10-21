@@ -50,12 +50,30 @@ print(f"val has {len(val_ids):,} tokens")
 
 def generate_char_wavelets(chars, wavelet_length=32):
     char_wavelets = {}
-    for i, char in enumerate(chars):
-        wavelet = pywt.Wavelet('db1')
-        phi, psi, x = wavelet.wavefun(level=5)
-        psi = psi / np.max(np.abs(psi))
-        psi_resized = np.interp(np.linspace(0, 1, wavelet_length), np.linspace(0, 1, len(psi)), psi)
-        char_wavelets[char] = psi_resized
+    wavelet_types = ['db1', 'db2', 'db3', 'db4', 'sym2', 'sym3', 'sym4', 'coif1', 'coif2', 'bior1.1', 'bior1.3', 'bior1.5']
+    
+    for char in chars:
+        # Use the character's ASCII value to seed the random number generator
+        np.random.seed(ord(char))
+        
+        # Choose a random wavelet type
+        wavelet_type = np.random.choice(wavelet_types)
+        wavelet = pywt.Wavelet(wavelet_type)
+        
+        # Generate wavelet coefficients
+        coeffs = wavelet.dec_lo
+        
+        # Normalize and resize
+        coeffs = coeffs / np.max(np.abs(coeffs))
+        coeffs_resized = np.interp(np.linspace(0, 1, wavelet_length), np.linspace(0, 1, len(coeffs)), coeffs)
+        
+        # Add some random noise to make it more unique
+        noise = np.random.normal(0, 0.1, wavelet_length)
+        coeffs_resized += noise
+        coeffs_resized = coeffs_resized / np.max(np.abs(coeffs_resized))
+        
+        char_wavelets[char] = coeffs_resized
+    
     return char_wavelets
 
 char_wavelets = generate_char_wavelets(chars)
